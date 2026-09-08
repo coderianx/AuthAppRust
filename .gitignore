@@ -1,0 +1,6 @@
+/target
+
+# SQLite
+auth.db
+auth.db-wal
+auth.db-shm
