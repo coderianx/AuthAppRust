@@ -1,4 +1,5 @@
-use axum::{Json, Router, extract::State, routing::get, routing::post};
+use axum::{Json, Router, extract::State, http::StatusCode, routing::get, routing::post};
+use bcrypt::{DEFAULT_COST, hash, verify};
 use serde::{Deserialize, Serialize};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
 use std::net::SocketAddr;
@@ -41,7 +42,7 @@ async fn main() {
     sqlx::query(
         "
         CREATE TABLE IF NOT EXISTS users (
-            id BIGINT PRIMARY KEY,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
             username TEXT NOT NULL UNIQUE,
             password TEXT NOT NULL
         );
@@ -79,39 +80,82 @@ async fn health(State(state): State<AppState>) -> &'static str {
 async fn register(
     State(state): State<AppState>,
     Json(user): Json<RegisterRequest>,
-) -> Json<Response> {
+) -> Result<Json<Response>, (StatusCode, Json<Response>)> {
+    if user.password.len() < 8 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(Response {
+                message: "Şifre en az 8 karakter olmalı".to_string(),
+            }),
+        ));
+    }
+
+    let password_hash = hash(&user.password, DEFAULT_COST).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(Response {
+                message: format!("Şifre hash'lenemedi: {e}"),
+            }),
+        )
+    })?;
+
     let result = sqlx::query("INSERT INTO users (username, password) VALUES (?, ?)")
         .bind(&user.username)
-        .bind(&user.password)
+        .bind(&password_hash)
         .execute(&state.db)
         .await;
 
     match result {
-        Ok(_) => Json(Response {
+        Ok(_) => Ok(Json(Response {
             message: "Kullanıcı başarıyla kaydedildi".to_string(),
-        }),
-        Err(e) => Json(Response {
-            message: e.to_string(),
-        }),
+        })),
+        Err(sqlx::Error::Database(db_err)) if db_err.is_unique_violation() => Err((
+            StatusCode::CONFLICT,
+            Json(Response {
+                message: "Bu kullanıcı adı zaten alınmış".to_string(),
+            }),
+        )),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(Response {
+                message: e.to_string(),
+            }),
+        )),
     }
 }
 
 async fn login(
     State(state): State<AppState>,
     Json(credentials): Json<LoginRequest>,
-) -> Json<Response> {
-    let results = sqlx::query("SELECT * FROM users WHERE username = ? AND password = ?")
+) -> Result<Json<Response>, (StatusCode, Json<Response>)> {
+    let row: Option<(String,)> = sqlx::query_as("SELECT password FROM users WHERE username = ?")
         .bind(&credentials.username)
-        .bind(&credentials.password)
-        .fetch_all(&state.db)
-        .await;
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(Response {
+                    message: e.to_string(),
+                }),
+            )
+        })?;
 
-    match results {
-        Ok(_) => Json(Response {
+    let valid = match row {
+        Some((password_hash,)) => verify(&credentials.password, &password_hash).unwrap_or(false),
+        None => false,
+    };
+
+    if valid {
+        Ok(Json(Response {
             message: "Giriş başarılı".to_string(),
-        }),
-        Err(e) => Json(Response {
-            message: e.to_string(),
-        }),
+        }))
+    } else {
+        Err((
+            StatusCode::UNAUTHORIZED,
+            Json(Response {
+                message: "Kullanıcı adı veya şifre hatalı".to_string(),
+            }),
+        ))
     }
 }
